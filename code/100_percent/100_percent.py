@@ -13,6 +13,9 @@ from tkinter import ttk, messagebox
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import mysql.connector
+from mysql.connector import Error
+import datetime
 
 @contextmanager
 def suppress_stdout():
@@ -26,6 +29,60 @@ def suppress_stdout():
 
 warnings.filterwarnings("ignore")
 
+def get_db_connection():
+    try:
+        connection = mysql.connector.connect(
+            host='localhost',  # Adjust as needed
+            database='grna_db',  # Create this database manually
+            user='root',  # Adjust as needed
+            password='root'  # Adjust as needed
+        )
+        return connection
+    except Error as e:
+        messagebox.showerror("Database Error", f"Failed to connect to database: {str(e)}")
+        return None
+
+def initialize_db():
+    connection = get_db_connection()
+    if connection:
+        cursor = connection.cursor()
+        try:
+            # Create sequences table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sequences (
+                    id VARCHAR(50) PRIMARY KEY,
+                    sequence TEXT NOT NULL,
+                    timestamp DATETIME NOT NULL
+                )
+            """)
+            # Create results table with ON DELETE CASCADE
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS results (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    sequence_id VARCHAR(50) NOT NULL,
+                    grna_sequence VARCHAR(20) NOT NULL,
+                    start INT NOT NULL,
+                    end INT NOT NULL,
+                    azimuth_score FLOAT NOT NULL,
+                    accessibility_score FLOAT NOT NULL,
+                    total_score FLOAT NOT NULL,
+                    mfe FLOAT NOT NULL,
+                    structure VARCHAR(255) NOT NULL,
+                    pam_sequence VARCHAR(3) NOT NULL,
+                    gc_content FLOAT NOT NULL,
+                    FOREIGN KEY (sequence_id) REFERENCES sequences(id) ON DELETE CASCADE
+                )
+            """)
+            connection.commit()
+        except Error as e:
+            messagebox.showerror("Database Error", f"Failed to initialize database: {str(e)}")
+        finally:
+            cursor.close()
+            connection.close()
+
+# Call initialize_db at startup
+initialize_db()
+
 def find_forward_grna_candidates(target_sequence, pam_pattern=r'[ACGT]GG'):
     seq = target_sequence.upper()
     candidates = []
@@ -35,14 +92,18 @@ def find_forward_grna_candidates(target_sequence, pam_pattern=r'[ACGT]GG'):
         if re.fullmatch(pam_pattern, pam):
             candidates.append({
                 "sequence": spacer,
+                "pam": pam,
                 "start": i + 1,
                 "end": i + 23
             })
     return candidates
 
-def filter_grna(gRNA_seq, gc_min=0.4, gc_max=0.6):
+def calculate_gc_content(gRNA_seq):
     gc_count = gRNA_seq.count('G') + gRNA_seq.count('C')
-    gc_content = gc_count / len(gRNA_seq)
+    return gc_count / len(gRNA_seq)
+
+def filter_grna(gRNA_seq, gc_min=0.4, gc_max=0.6):
+    gc_content = calculate_gc_content(gRNA_seq)
     if not (gc_min <= gc_content <= gc_max):
         return False
     if 'TTTT' in gRNA_seq:
@@ -192,7 +253,7 @@ class gRNAApp:
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
         
-        # Button frame for Save and Visualize buttons
+        # Button frame for Save CSV, Save DB, Visualize, and Manage DB buttons
         button_frame = ttk.Frame(results_frame)
         button_frame.pack(side=tk.RIGHT, pady=(8, 0))
         
@@ -200,8 +261,17 @@ class gRNAApp:
                    command=self.visualize_results, style='Bold.TButton').pack(side=tk.LEFT, padx=(0, 5))
         
         ttk.Button(button_frame, text="Save Results to CSV", padding="4", 
-                   command=self.save_results, style='Bold.TButton').pack(side=tk.LEFT)
-    
+                   command=self.save_results_csv, style='Bold.TButton').pack(side=tk.LEFT, padx=(0, 5))
+        
+        ttk.Button(button_frame, text="Save to Database", padding="4", 
+                   command=self.save_to_database, style='Bold.TButton').pack(side=tk.LEFT, padx=(0, 5))
+        
+        ttk.Button(button_frame, text="Manage Database", padding="4", 
+                   command=self.manage_database, style='Bold.TButton').pack(side=tk.LEFT)
+
+        # Store scored_list for later use
+        self.scored_list = []
+
     def run_analysis(self):
         self.tree.delete(*self.tree.get_children())
         self.root.update()
@@ -238,10 +308,11 @@ class gRNAApp:
                 else:
                     accessibility_score, struct, mfe = result
                 total_score = 0.6 * azimuth_score + 0.4 * accessibility_score
-                heapq.heappush(heap, (-total_score, seq, cand["start"], cand["end"], struct, accessibility_score, azimuth_score, mfe))
+                gc_content = calculate_gc_content(seq)
+                heapq.heappush(heap, (-total_score, seq, cand["start"], cand["end"], struct, accessibility_score, azimuth_score, mfe, cand["pam"], gc_content))
             
             while heap:
-                neg_score, seq, start, end, struct, accessibility_score, azimuth_score, mfe = heapq.heappop(heap)
+                neg_score, seq, start, end, struct, accessibility_score, azimuth_score, mfe, pam, gc_content = heapq.heappop(heap)
                 scored_list.append({
                     "sequence": seq,
                     "start": start,
@@ -250,8 +321,12 @@ class gRNAApp:
                     "azimuth_score": azimuth_score,
                     "total_score": -neg_score,
                     "mfe": mfe,
-                    "structure": struct
+                    "structure": struct,
+                    "pam": pam,
+                    "gc_content": gc_content
                 })
+            
+            self.scored_list = scored_list
             
             for entry in scored_list:
                 self.tree.insert("", tk.END, values=(
@@ -270,6 +345,291 @@ class gRNAApp:
         except Exception as e:
             messagebox.showerror("Error", f"An error occurred: {str(e)}")
     
+    def save_to_database(self):
+        if not self.scored_list:
+            messagebox.showwarning("Warning", "No results to save")
+            return
+        
+        sequence = self.seq_entry.get("1.0", tk.END).strip()
+        
+        # Prompt for sequence ID
+        seq_id = tk.simpledialog.askstring("Sequence ID", "Enter Sequence ID (alphanumeric):")
+        if not seq_id:
+            return
+        
+        connection = get_db_connection()
+        if connection:
+            cursor = connection.cursor()
+            try:
+                # Insert sequence with timestamp
+                timestamp = datetime.datetime.now()
+                cursor.execute("""
+                    INSERT INTO sequences (id, sequence, timestamp) 
+                    VALUES (%s, %s, %s) 
+                    ON DUPLICATE KEY UPDATE sequence = %s, timestamp = %s
+                """, (seq_id, sequence, timestamp, sequence, timestamp))
+                
+                # Insert results
+                for entry in self.scored_list:
+                    cursor.execute("""
+                        INSERT INTO results 
+                        (sequence_id, grna_sequence, start, end, azimuth_score, accessibility_score, total_score, mfe, structure, pam_sequence, gc_content)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (seq_id, entry["sequence"], entry["start"], entry["end"], entry["azimuth_score"],
+                          entry["accessibility_score"], entry["total_score"], entry["mfe"], entry["structure"],
+                          entry["pam"], entry["gc_content"]))
+                
+                connection.commit()
+                messagebox.showinfo("Success", "Results saved to database")
+            except Error as e:
+                messagebox.showerror("Database Error", f"Failed to save to database: {str(e)}")
+            finally:
+                cursor.close()
+                connection.close()
+
+    def manage_database(self):
+        manage_window = tk.Toplevel(self.root)
+        manage_window.title("Manage Database")
+        manage_window.geometry("900x650")
+        manage_window.transient(self.root)
+        manage_window.grab_set()
+
+        # ---- Styles ----------------------------------------------------
+        style = ttk.Style()
+        style.configure('Bold.TNotebook.Tab', font=('Arial', 12, 'bold'))
+        style.configure('Query.TButton', font=('Arial', 11, 'bold'), padding=6)
+
+        # ---- Notebook --------------------------------------------------
+        notebook = ttk.Notebook(manage_window, style='Bold.TNotebook')
+        notebook.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+
+        # ------------------- SEARCH QUERIES TAB -------------------------
+        search_frame = ttk.Frame(notebook, padding=15)
+        notebook.add(search_frame, text="Search Queries")
+
+        search_frame.pack_propagate(False)
+        search_frame.grid_rowconfigure(0, weight=1)
+        search_frame.grid_columnconfigure(0, weight=1)
+
+        inner = ttk.Frame(search_frame)
+        inner.grid(row=0, column=0, sticky="nsew")
+
+        queries = [
+            ("All gRNAs for a given sequence",                self.query_all_grnas_for_sequence),
+            ("Top-N best gRNAs (by total score)",              self.query_top_n_grnas),
+            ("Top-N best gRNAs by score threshold",            self.query_top_n_by_threshold),   # NEW
+            ("gRNAs with a specific PAM",                      self.query_grnas_by_pam),
+            ("gRNAs in a GC-range",                            self.query_grnas_by_gc_range),
+            ("Search by partial DNA",                          self.query_by_partial_dna),
+            ("Count gRNAs per sequence",                       self.query_count_grnas_per_sequence),
+            ("Export a full analysis for a gene",              self.query_full_analysis_for_gene),
+        ]
+
+        for i, (label, func) in enumerate(queries):
+            btn = ttk.Button(inner, text=label, command=func,
+                             style='Query.TButton', width=50)
+            btn.grid(row=i, column=0, pady=7, padx=10, sticky="w")
+
+        # Add vertical scrollbar if needed
+        canvas = tk.Canvas(search_frame)
+        vbar = ttk.Scrollbar(search_frame, orient="vertical", command=canvas.yview)
+        scroll_inner = ttk.Frame(canvas)
+        scroll_inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.create_window((0,0), window=scroll_inner, anchor="nw")
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+
+        # Move buttons to scroll_inner
+        for widget in inner.winfo_children():
+            widget.destroy()
+        for i, (label, func) in enumerate(queries):
+            btn = ttk.Button(scroll_inner, text=label, command=func,
+                             style='Query.TButton', width=50)
+            btn.grid(row=i, column=0, pady=7, padx=10, sticky="w")
+
+        # ------------------- DELETE OPERATIONS TAB ----------------------
+        delete_frame = ttk.Frame(notebook, padding=15)
+        notebook.add(delete_frame, text="Delete Operations")
+
+        delete_frame.pack_propagate(False)
+        delete_frame.grid_rowconfigure(0, weight=1)
+        delete_frame.grid_columnconfigure(0, weight=1)
+
+        del_inner = ttk.Frame(delete_frame)
+        del_inner.grid(row=0, column=0, sticky="nsew")
+
+        delete_ops = [
+            ("Delete individual gRNA", self.delete_individual_grna),
+            ("Delete all for sequence", self.delete_all_for_sequence),
+        ]
+
+        for i, (label, func) in enumerate(delete_ops):
+            btn = ttk.Button(del_inner, text=label, command=func,
+                             style='Query.TButton', width=50)
+            btn.grid(row=i, column=0, pady=7, padx=10, sticky="w")
+    
+    def execute_query(self, sql, params=None, fetch=True):
+        connection = get_db_connection()
+        if connection:
+            cursor = connection.cursor(dictionary=True)
+            try:
+                cursor.execute(sql, params or ())
+                if fetch:
+                    results = cursor.fetchall()
+                    return results
+                else:
+                    connection.commit()
+            except Error as e:
+                messagebox.showerror("Database Error", f"Query failed: {str(e)}")
+            finally:
+                cursor.close()
+                connection.close()
+        return []
+
+    def show_query_results(self, results, title):
+        if not results:
+            messagebox.showinfo("No Results", "No results found")
+            return
+        
+        result_window = tk.Toplevel(self.root)
+        result_window.title(title)
+        result_window.geometry("1000x600")
+        
+        tree_frame = ttk.Frame(result_window)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        
+        vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        tree = ttk.Treeview(tree_frame, columns=list(results[0].keys()), show="headings", yscrollcommand=vsb.set)
+        vsb.config(command=tree.yview)
+        
+        for col in tree["columns"]:
+            tree.heading(col, text=col.upper())
+            tree.column(col, width=150, anchor=tk.CENTER)
+        
+        for row in results:
+            tree.insert("", tk.END, values=tuple(row.values()))
+        
+        tree.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.E, tk.W))
+        vsb.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+    def query_all_grnas_for_sequence(self):
+        seq_id = tk.simpledialog.askstring("Query", "Enter sequence ID:")
+        if seq_id:
+            sql = "SELECT * FROM results WHERE sequence_id = %s"
+            results = self.execute_query(sql, (seq_id,))
+            self.show_query_results(results, "All gRNAs for Sequence")
+
+    def query_top_n_grnas(self):
+        seq_id = tk.simpledialog.askstring("Query", "Enter sequence ID:")
+        n = tk.simpledialog.askinteger("Query", "Enter N (top N):", minvalue=1)
+        if seq_id and n:
+            sql = """
+                SELECT id AS grna_id, grna_sequence, total_score 
+                FROM results 
+                WHERE sequence_id = %s 
+                ORDER BY total_score DESC 
+                LIMIT %s
+            """
+            results = self.execute_query(sql, (seq_id, n))
+            self.show_query_results(results, f"Top {n} gRNAs for Sequence")
+
+    def query_grnas_by_pam(self):
+        pam = tk.simpledialog.askstring("Query", "Enter PAM sequence (e.g., NAG):")
+        if pam:
+            sql = "SELECT * FROM results WHERE pam_sequence = %s"
+            results = self.execute_query(sql, (pam,))
+            self.show_query_results(results, f"gRNAs with PAM {pam}")
+
+    def query_grnas_by_gc_range(self):
+        min_gc = tk.simpledialog.askfloat("Query", "Enter min GC content:", minvalue=0.0, maxvalue=1.0)
+        max_gc = tk.simpledialog.askfloat("Query", "Enter max GC content:", minvalue=0.0, maxvalue=1.0)
+        if min_gc is not None and max_gc is not None:
+            sql = "SELECT * FROM results WHERE gc_content BETWEEN %s AND %s"
+            results = self.execute_query(sql, (min_gc, max_gc))
+            self.show_query_results(results, f"gRNAs in GC range {min_gc}-{max_gc}")
+
+    def query_by_partial_dna(self):
+        motif = tk.simpledialog.askstring("Query", "Enter partial DNA motif:")
+        if motif:
+            sql = """
+                SELECT s.id, s.sequence, r.grna_sequence 
+                FROM sequences s 
+                LEFT JOIN results r ON s.id = r.sequence_id 
+                WHERE s.sequence LIKE %s
+            """
+            results = self.execute_query(sql, (f"%{motif}%",))
+            self.show_query_results(results, "Search by Partial DNA")
+
+    def query_count_grnas_per_sequence(self):
+        sql = """
+            SELECT s.id, COUNT(r.id) AS num_grnas 
+            FROM sequences s 
+            LEFT JOIN results r ON s.id = r.sequence_id 
+            GROUP BY s.id
+        """
+        results = self.execute_query(sql)
+        self.show_query_results(results, "Count gRNAs per Sequence")
+
+    def query_top_n_by_threshold(self):
+        seq_id = tk.simpledialog.askstring(
+            "Sequence ID", "Enter sequence ID:")
+        if not seq_id:
+            return
+
+        n = tk.simpledialog.askinteger(
+            "Top-N", "How many top gRNAs do you want?", minvalue=1, maxvalue=1000)
+        if n is None:
+            return
+
+        threshold = tk.simpledialog.askfloat(
+            "Score Threshold",
+            "Minimum total_score (0–1, e.g. 0.7):",
+            minvalue=0.0, maxvalue=1.0)
+        if threshold is None:
+            return
+
+        sql = """
+            SELECT id AS grna_id, grna_sequence, total_score, azimuth_score,
+                   accessibility_score, mfe, pam_sequence, gc_content
+            FROM results
+            WHERE sequence_id = %s AND total_score >= %s
+            ORDER BY total_score DESC
+            LIMIT %s
+        """
+        results = self.execute_query(sql, (seq_id, threshold, n))
+        title = f"Top {n} gRNAs for '{seq_id}' (score ≥ {threshold:.3f})"
+        self.show_query_results(results, title)
+
+    def query_full_analysis_for_gene(self):
+        gene_id = tk.simpledialog.askstring("Query", "Enter gene/sequence ID (e.g., BRCA1-exon2):")
+        if gene_id:
+            sql = """
+                SELECT s.id AS name, r.* 
+                FROM sequences s 
+                JOIN results r ON s.id = r.sequence_id 
+                WHERE s.id = %s
+            """
+            results = self.execute_query(sql, (gene_id,))
+            self.show_query_results(results, f"Full Analysis for {gene_id}")
+
+    def delete_individual_grna(self):
+        grna_id = tk.simpledialog.askinteger("Delete", "Enter gRNA ID to delete:")
+        if grna_id:
+            sql = "DELETE FROM results WHERE id = %s"
+            self.execute_query(sql, (grna_id,), fetch=False)
+            messagebox.showinfo("Success", f"gRNA {grna_id} deleted")
+
+    def delete_all_for_sequence(self):
+        seq_id = tk.simpledialog.askstring("Delete", "Enter sequence ID to delete all gRNAs:")
+        if seq_id:
+            sql = "DELETE FROM sequences WHERE id = %s"  # Cascade will delete results
+            self.execute_query(sql, (seq_id,), fetch=False)
+            messagebox.showinfo("Success", f"All data for sequence {seq_id} deleted")
+
     def visualize_results(self):
         if not self.tree.get_children():
             messagebox.showwarning("Warning", "No results to visualize")
@@ -442,7 +802,7 @@ class gRNAApp:
         scrollable_frame.update_idletasks()
         canvas_widget.config(scrollregion=canvas_widget.bbox("all"))
     
-    def save_results(self):
+    def save_results_csv(self):
         if not self.tree.get_children():
             messagebox.showwarning("Warning", "No results to save")
             return
@@ -457,6 +817,13 @@ class gRNAApp:
             messagebox.showinfo("Success", "Results saved to grna_candidates.csv")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save results: {str(e)}")
+    
+    def save_plot(self, fig):
+        try:
+            fig.savefig("grna_visualization.png")
+            messagebox.showinfo("Success", "Plot saved as grna_visualization.png")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save plot: {str(e)}")
 
 if __name__ == "__main__":
     root = tk.Tk()
